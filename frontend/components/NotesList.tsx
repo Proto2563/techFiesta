@@ -17,6 +17,39 @@ import { apiFetch } from "@/app/lib/api";
 import { useNote } from "@/app/contexts/NotesContext";
 import { transcribeFile } from "@/app/lib/transcribe";
 
+// Helper function to format plain text into Lexical JSON structure
+const createLexicalState = (text: string) => {
+  return JSON.stringify({
+    root: {
+      children: [
+        {
+          children: [
+            {
+              detail: 0,
+              format: 0,
+              mode: "normal",
+              style: "",
+              text: text,
+              type: "text",
+              version: 1,
+            },
+          ],
+          direction: "ltr",
+          format: "",
+          indent: 0,
+          type: "paragraph",
+          version: 1,
+        },
+      ],
+      direction: "ltr",
+      format: "",
+      indent: 0,
+      type: "root",
+      version: 1,
+    },
+  });
+};
+
 type Note = {
   id: string;
   name: string;
@@ -151,7 +184,13 @@ export default function NotesList() {
 
     try {
       const data = await transcribeFile(file);
-      const content = `# Transcript\n\n${data.transcript}\n\n# Summary\n\n${(data.summary || []).join("\n")}`;
+      
+      // 1. Construct the raw text content
+      const rawText = `# Transcript\n\n${data.transcript}\n\n# Summary\n\n${(data.summary || []).join("\n")}`;
+      
+      // 2. Format it into the JSON structure that Lexical Editor expects
+      const content = createLexicalState(rawText);
+
       await addNote(file.name, content);
     } catch (err) {
       console.error("Transcription failed", err);
