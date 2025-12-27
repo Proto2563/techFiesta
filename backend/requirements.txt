@@ -7,3 +7,9 @@ ffmpeg-python
 yt-dlp
 pymupdf
 numpy
+# --- New Dependencies for RAG/Notebook features ---
+langchain
+langchain-community
+langchain-huggingface
+sentence-transformers
+faiss-cpu

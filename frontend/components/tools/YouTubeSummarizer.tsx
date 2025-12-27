@@ -1,12 +1,26 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { Button } from "@/components/ui/button";
-import { Youtube, Loader2, Copy, CheckCircle2 } from "lucide-react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { 
+  Youtube, 
+  Loader2, 
+  Copy, 
+  CheckCircle2, 
+  AlertTriangle, 
+  Cookie, 
+  FileText, 
+  Image as ImageIcon, 
+  AlignLeft 
+} from "lucide-react";
+import ReactMarkdown from 'react-markdown';
 
+// Updated to match the new backend response structure
 type ApiResponse = {
   transcript: string;
-  summary: string[];
+  notes: string;
+  image_url: string | null;
   error?: string;
 };
 
@@ -14,12 +28,18 @@ export default function YouTubeSummarizer() {
   const [url, setUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<ApiResponse | null>(null);
+  const [errorMsg, setErrorMsg] = useState("");
+  
+  // Cookie Upload States
+  const [cookieStatus, setCookieStatus] = useState<"idle" | "uploading" | "success" | "error">("idle");
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleSummarize = async () => {
     if (!url) return;
 
     setLoading(true);
     setResult(null);
+    setErrorMsg("");
 
     try {
       const res = await fetch("http://127.0.0.1:8000/youtube_summarize", {
@@ -29,27 +49,86 @@ export default function YouTubeSummarizer() {
       });
 
       const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      
+      if (data.error) {
+        throw new Error(data.error);
+      }
+      
       setResult(data);
-    } catch (err) {
+    } catch (err: any) {
       console.error("YouTube Error:", err);
-      alert("Failed to process video. Check the backend logs for details.");
+      if (err.message.includes("restricted") || err.message.includes("download") || err.message.includes("cookies")) {
+        setErrorMsg("Failed to download. If this is age-restricted, please upload your 'cookies.txt' file below.");
+      } else {
+        setErrorMsg(err.message || "Failed to process video.");
+      }
     } finally {
       setLoading(false);
     }
   };
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
+  const handleCookieUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setCookieStatus("uploading");
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const res = await fetch("http://127.0.0.1:8000/upload_cookies", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await res.json();
+      
+      if (data.error) throw new Error(data.error);
+      
+      setCookieStatus("success");
+      setTimeout(() => setCookieStatus("idle"), 3000); // Reset after 3 seconds
+    } catch (err) {
+      console.error("Cookie Upload Error:", err);
+      setCookieStatus("error");
+    }
   };
 
   return (
     <div className="space-y-5 text-sm text-neutral-300">
-      <h2 className="font-semibold text-lg text-white flex items-center gap-2">
-        <Youtube className="text-red-500" /> YouTube Summarizer
-      </h2>
+      <div className="flex items-center justify-between">
+        <h2 className="font-semibold text-lg text-white flex items-center gap-2">
+          <Youtube className="text-red-500" /> YouTube Summarizer
+        </h2>
+        
+        {/* Cookie Upload Button */}
+        <div>
+          <input 
+            type="file" 
+            accept=".txt" 
+            ref={fileInputRef} 
+            className="hidden" 
+            onChange={handleCookieUpload}
+          />
+          <Button 
+            variant="outline" 
+            size="sm" 
+            className="border-neutral-700 bg-neutral-800 text-neutral-400 hover:text-white hover:bg-neutral-700"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={cookieStatus === "uploading"}
+          >
+            {cookieStatus === "uploading" ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin mr-2" />
+            ) : cookieStatus === "success" ? (
+              <CheckCircle2 className="w-3.5 h-3.5 text-green-500 mr-2" />
+            ) : (
+              <Cookie className="w-3.5 h-3.5 mr-2" />
+            )}
+            {cookieStatus === "success" ? "Cookies Updated!" : "Upload Cookies"}
+          </Button>
+        </div>
+      </div>
+
       <p className="text-neutral-400">
-        Paste a YouTube link to get a transcript and summary.
+        Paste a YouTube link to get structured lecture notes, a mind map, and the transcript.
       </p>
 
       {/* Input Section */}
@@ -70,39 +149,84 @@ export default function YouTubeSummarizer() {
         </Button>
       </div>
 
+      {/* Error Display */}
+      {errorMsg && (
+        <div className="bg-red-950/30 border border-red-900/50 p-3 rounded-md flex items-start gap-3 text-red-200">
+          <AlertTriangle className="w-5 h-5 text-red-500 mt-0.5" />
+          <div>
+            <p className="font-medium">Download Failed</p>
+            <p className="text-xs opacity-90">{errorMsg}</p>
+          </div>
+        </div>
+      )}
+
       {/* Result Section */}
       {result && (
-        <div className="border border-neutral-800 bg-neutral-900/50 rounded-lg p-4 space-y-4 animate-in fade-in slide-in-from-bottom-2">
-          
-          {/* Summary */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-white font-medium">
-              <span className="flex items-center gap-2"><CheckCircle2 size={16} className="text-green-500"/> Summary</span>
-              <Button variant="ghost" size="sm" onClick={() => copyToClipboard(result.summary.join("\n"))}>
-                <Copy size={14} className="mr-1"/> Copy
-              </Button>
-            </div>
-            <ul className="list-disc list-inside space-y-1 text-neutral-300">
-              {result.summary.map((point, idx) => (
-                <li key={idx}>{point}</li>
-              ))}
-            </ul>
-          </div>
+        <div className="border border-neutral-800 bg-neutral-900/50 rounded-lg p-4 animate-in fade-in slide-in-from-bottom-2">
+          <Tabs defaultValue="notes" className="w-full">
+            <TabsList className="grid w-full grid-cols-3 bg-neutral-950 border border-neutral-800">
+              <TabsTrigger value="notes" className="data-[state=active]:bg-neutral-800 data-[state=active]:text-white">
+                <FileText className="w-4 h-4 mr-2" /> Lecture Notes
+              </TabsTrigger>
+              <TabsTrigger value="visuals" className="data-[state=active]:bg-neutral-800 data-[state=active]:text-white">
+                <ImageIcon className="w-4 h-4 mr-2" /> Mind Map
+              </TabsTrigger>
+              <TabsTrigger value="transcript" className="data-[state=active]:bg-neutral-800 data-[state=active]:text-white">
+                <AlignLeft className="w-4 h-4 mr-2" /> Transcript
+              </TabsTrigger>
+            </TabsList>
+            
+            {/* Tab 1: Lecture Notes */}
+            <TabsContent value="notes" className="mt-4 space-y-4">
+              <div className="flex justify-end">
+                <Button variant="ghost" size="sm" onClick={() => navigator.clipboard.writeText(result.notes)}>
+                  <Copy size={14} className="mr-1"/> Copy Markdown
+                </Button>
+              </div>
+              <div className="prose prose-invert prose-sm max-w-none bg-neutral-950/50 p-6 rounded-md border border-neutral-800">
+                <ReactMarkdown>{result.notes}</ReactMarkdown>
+              </div>
+            </TabsContent>
 
-          <div className="border-t border-neutral-800 my-2"></div>
+            {/* Tab 2: Visuals */}
+            <TabsContent value="visuals" className="mt-4">
+              {result.image_url ? (
+                <div className="flex flex-col items-center p-4 bg-white rounded-md border border-neutral-700">
+                  {/* We use standard img tag for local backend images */}
+                  <img 
+                    src={result.image_url} 
+                    alt="Mind Map" 
+                    className="max-w-full h-auto" 
+                  />
+                  <a 
+                    href={result.image_url} 
+                    download="mindmap.png" 
+                    className="mt-4 text-blue-600 hover:underline text-xs font-medium"
+                  >
+                    Download PNG
+                  </a>
+                </div>
+              ) : (
+                <div className="text-center py-10 text-neutral-500 border border-dashed border-neutral-800 rounded-md">
+                  <AlertTriangle className="mx-auto w-8 h-8 mb-2 opacity-50"/>
+                  <p>Could not generate visual diagram.</p>
+                  <p className="text-xs opacity-70 mt-1">Ensure Graphviz is installed on the backend.</p>
+                </div>
+              )}
+            </TabsContent>
 
-          {/* Transcript */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-white font-medium">
-              <span>Full Transcript</span>
-              <Button variant="ghost" size="sm" onClick={() => copyToClipboard(result.transcript)}>
-                <Copy size={14} className="mr-1"/> Copy
-              </Button>
-            </div>
-            <p className="text-neutral-400 text-xs leading-relaxed max-h-60 overflow-y-auto bg-neutral-950 p-3 rounded-md">
-              {result.transcript}
-            </p>
-          </div>
+            {/* Tab 3: Transcript */}
+            <TabsContent value="transcript" className="mt-4 space-y-2">
+               <div className="flex justify-end">
+                <Button variant="ghost" size="sm" onClick={() => navigator.clipboard.writeText(result.transcript)}>
+                  <Copy size={14} className="mr-1"/> Copy Text
+                </Button>
+              </div>
+               <div className="bg-neutral-950 p-4 rounded-md border border-neutral-800 h-96 overflow-y-auto text-xs leading-relaxed text-neutral-400 font-mono whitespace-pre-wrap">
+                {result.transcript}
+               </div>
+            </TabsContent>
+          </Tabs>
         </div>
       )}
     </div>

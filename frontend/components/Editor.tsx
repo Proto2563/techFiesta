@@ -12,7 +12,7 @@ type EditorProps = {
 export default function Editor({ setChanged }: EditorProps) {
   const { content, setContent, selectedNoteId } = useNote();
   const editor = useCreateBlockNote();
-  const [a, setA] = useState(false)
+  const [isMounted, setIsMounted] = useState(false);
 
   // -----------------------------
   // Load content into editor
@@ -20,48 +20,54 @@ export default function Editor({ setChanged }: EditorProps) {
   useEffect(() => {
     if (!editor) return;
     if (!content) return;
-    if(a) return;
+    if (isMounted) return;
+
     try {
       const parsed = JSON.parse(content);
       editor.replaceBlocks(editor.document, parsed);
-    
     } catch {
-      // FIXED: Only one paragraph block, preserve newlines
+      // Fallback: Only one paragraph block
       const block = {
         type: "paragraph",
         content: [
           {
             type: "text",
-            text: content
-          }
-        ]
+            text: content || "",
+          },
+        ],
       };
 
       editor.replaceBlocks(editor.document, [block] as any);
-   
     }
-  }, [editor,content, selectedNoteId]);
+  }, [editor, content, selectedNoteId]);
 
+  // -----------------------------
+  // Handle Editor Changes
+  // -----------------------------
   useEffect(() => {
     if (!editor) return;
 
     const unsubscribe = editor.onChange(() => {
       const json = JSON.stringify(editor.document);
-      console.log(editor.document)
       setContent(json);
       setChanged(true);
-      setA(true)
+      setIsMounted(true);
     });
 
     return unsubscribe;
   }, [editor, setContent, setChanged]);
 
-useEffect(() => {setA(false)}, [selectedNoteId])
+  useEffect(() => {
+    setIsMounted(false);
+  }, [selectedNoteId]);
+
+  // -----------------------------
+  // Keyboard Shortcuts (Ctrl+S)
+  // -----------------------------
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "s") {
         e.preventDefault();
-        // we don't save here; parent handles save
         const event = new CustomEvent("save_note");
         window.dispatchEvent(event);
       }
@@ -72,10 +78,15 @@ useEffect(() => {setA(false)}, [selectedNoteId])
   }, []);
 
   return (
-    <BlockNoteView
-      editor={editor}
-      theme="dark"
-      className="bg-neutral-950 h-full p-6 overflow-auto"
-    />
+    // Simple scrolling wrapper for the editor only
+    <div className="bg-neutral-950 h-full w-full overflow-y-auto custom-scrollbar">
+      <div className="p-8 max-w-5xl mx-auto min-h-full">
+        <BlockNoteView
+          editor={editor}
+          theme="dark"
+          className="bg-transparent" 
+        />
+      </div>
+    </div>
   );
 }

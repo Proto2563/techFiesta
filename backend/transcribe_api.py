@@ -1,7 +1,9 @@
-from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from faster_whisper import WhisperModel
-from transformers import pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from pydantic import BaseModel
 import shutil
 import os
 import tempfile
@@ -9,10 +11,27 @@ import yt_dlp
 import fitz  # PyMuPDF
 import re
 import numpy as np
+import json
+import subprocess
+import torch
 from collections import Counter
 import time
+import difflib
+import random  # ADDED: To shuffle options programmatically
+
+# --- CRITICAL FIX: Prevent Deadlocks on Mac/Linux ---
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# --- LangChain Imports ---
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 
 app = FastAPI()
+
+# --- Serve the 'tmp' folder so frontend can load generated images ---
+app.mount("/tmp", StaticFiles(directory="tmp"), name="tmp")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,284 +46,479 @@ app.add_middleware(
 # --------------------
 print("Loading Models...")
 
-# High Quality Model
-whisper_model_file = WhisperModel("distil-large-v3", device="cpu", compute_type="int8")
+# A. Transcription (Whisper) - Mac Optimized
+#whisper_model = WhisperModel("Systran/faster-distil-whisper-large-v3", device="cpu", compute_type="int8")
+whisper_model = WhisperModel("Systran/faster-distil-whisper-medium.en", device="cpu", compute_type="int8")
+whisper_live = WhisperModel("small.en", device="cpu", compute_type="int8")
 
-# Fast Model for Live Streaming
-whisper_model_live = WhisperModel("small.en", device="cpu", compute_type="int8")
+# B. LLM for Notes & RAG (Qwen 1.5B)
+LLM_ID = "Qwen/Qwen2.5-1.5B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(LLM_ID)
 
-# Summarizer (for audio/video)
+llm_model = AutoModelForCausalLM.from_pretrained(
+    LLM_ID,
+    dtype=torch.float32, 
+)
+llm_model.eval()
+
+# C. Legacy Summarizer
 summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=-1)
 
-print("Models Loaded!")
+print("✅ Models Loaded!")
 
 # --------------------
-# Helper: PDF Summarizer Logic (Adapted from pdf_summarizer_final.py)
+# Helper: LLM Generation
 # --------------------
-def accurate_35_summarize(text, target_ratio=0.35):
-    """TRUE 35% word coverage"""
+def generate_llm(messages, max_new_tokens=1024, temperature=0.7):
+    """Runs the Qwen model to generate text/code"""
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(text, return_tensors="pt").to(llm_model.device)
     
-    # 1. CLEAN TEXT
-    text = re.sub(r'\s+', ' ', text)
-    sentences = re.split(r'(?<=[\.!?])\s+', text)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
+    with torch.no_grad():
+        out = llm_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=True,
+            repetition_penalty=1.1
+        )
+    return tokenizer.decode(out[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True)
 
-    if not sentences:
-        return "Not enough text to summarize."
+# --------------------
+# CLASS: Lecture Doubt Solver
+# --------------------
+class LectureDoubtSolver:
+    def __init__(self):
+        print("🚀 Initializing RAG Engine...")
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        self.vector_store = None
+        self.retriever = None
 
-    # 2. DEDUPLICATE
-    unique_sentences = []
-    seen = set()
-    for sent in sentences:
-        h = hash(sent.lower())
-        if h not in seen:
-            unique_sentences.append(sent)
-            seen.add(h)
-    sentences = unique_sentences
+    def process_lecture_data(self, transcript_text):
+        """Indexes the transcript into FAISS"""
+        if not transcript_text.strip():
+            return False
 
-    # 3. CALCULATE TARGET WORD COUNT
-    orig_words = len(re.findall(r'\b\w+\b', text))
-    target_words = max(500, int(orig_words * target_ratio))
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=600,
+            chunk_overlap=100
+        )
+        chunks = splitter.split_text(transcript_text)
+        
+        docs = [
+            Document(page_content=c, metadata={"source": f"Chunk {i+1}"})
+            for i, c in enumerate(chunks)
+        ]
 
-    # 4. SCORE ALL SENTENCES
-    all_words = re.findall(r'\b\w+\b', text.lower())
-    word_freq = Counter(all_words)
+        self.vector_store = FAISS.from_documents(docs, self.embeddings)
+        self.retriever = self.vector_store.as_retriever(search_kwargs={"k": 3})
+        return True
 
-    scored_sentences = []
-    for sent in sentences:
-        sent_words = re.findall(r'\b\w+\b', sent.lower())
-        # Avoid division by zero if word_freq is empty
-        if not sent_words: 
-            continue
+    def ask_doubt(self, question):
+        """Retrieves context and asks the LLM"""
+        if not self.retriever:
+            return "⚠️ No lecture has been indexed yet. Please upload/transcribe a file first."
+
+        docs = self.retriever.invoke(question)
+        context_text = "\n\n".join([d.page_content for d in docs])
+
+        messages = [
+            {"role": "system", "content": "You are a helpful Academic Assistant. Use ONLY the provided lecture context to answer. If the answer is not in the lecture, say you don't know."},
+            {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion:\n{question}"}
+        ]
+
+        answer = generate_llm(messages, max_new_tokens=512, temperature=0.3)
+        return answer
+
+# Initialize Global Solver Instance
+rag_solver = LectureDoubtSolver()
+
+# --------------------
+# Helper: Diagram Header
+# --------------------
+DOT_HEADER = """digraph G {
+    rankdir=LR;
+    nodesep=0.6;
+    ranksep=1.0;
+    splines=true;
+    node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#f8f9fa"];
+"""
+
+# --------------------
+# Helper: Processing Pipeline
+# --------------------
+def process_full_pipeline(audio_path, file_id):
+    # 1. Transcribe
+    print("🎤 Stage 1: Transcribing...")
+    segments, info = whisper_model.transcribe(audio_path, beam_size=5, language="en")
+    transcript = " ".join([s.text for s in segments]).strip()
+
+    # --- AUTO-INDEX FOR RAG ---
+    print("🧠 Indexing for RAG...")
+    rag_solver.process_lecture_data(transcript)
+    # --------------------------
+
+    # 2. Generate Lecture Notes
+    print("📝 Stage 2: Generating Notes...")
+    
+    chunks = [transcript[i:i+6000] for i in range(0, len(transcript), 6000)]
+    total_chunks = len(chunks)
+    print(f"   ↳ Found {total_chunks} chunks to process.")
+
+    chunk_summaries = []
+    
+    for i, chunk in enumerate(chunks):
+        print(f"   ⏳ Processing chunk {i+1}/{total_chunks}...") 
+        try:
+            summary = generate_llm([
+                {"role": "system", "content": "Summarize this section into detailed academic markdown notes."},
+                {"role": "user", "content": chunk}
+            ], max_new_tokens=512)
+            chunk_summaries.append(summary)
+        except Exception as e:
+            print(f"   ❌ Error processing chunk {i+1}: {e}")
+
+    merged_notes = "\n\n".join(chunk_summaries)
+    
+    print("   ↳ Finalizing notes...")
+    final_notes = generate_llm([
+        {"role": "system", "content": "Merge these summaries into one clean, structured set of Lecture Notes (Markdown). Use Headers, Bullet points, and Bold text."},
+        {"role": "user", "content": merged_notes[:10000]} 
+    ], max_new_tokens=1024)
+
+    # 3. Generate Visual Diagram
+    print("🎨 Stage 3: Visualizing...")
+    concepts = generate_llm([
+        {"role": "system", "content": "Extract 8 key concepts and their relationships from these notes."},
+        {"role": "user", "content": final_notes[:4000]}
+    ], max_new_tokens=256)
+
+    system_prompt = """
+    You are a Graphviz expert. Output ONLY the raw DOT code.
+    Rules:
+    1. Start with 'digraph G {'
+    2. End with '}'
+    3. Edges must use '->'
+    4. Labels must be double-quoted (e.g. label="text").
+    5. NO Markdown, NO triple quotes, NO comments.
+    """
+    
+    dot_code = None
+    for attempt in range(3):
+        try:
+            raw = generate_llm([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Create a simple diagram for: {concepts}"}
+            ], temperature=0.2)
             
-        score = sum(word_freq[w] * np.log(len(all_words) / word_freq[w])
-                   for w in sent_words if word_freq[w] > 1)
-        word_count = len(sent_words)
-        scored_sentences.append((score, word_count, sent))
+            # --- Aggressive Cleanup ---
+            # 1. Regex remove triple quotes completely
+            raw_clean = re.sub(r"'{3,}", "", raw)
+            raw_clean = re.sub(r'"{3,}', "", raw_clean)
+            
+            # 2. Remove code block markers
+            raw_clean = raw_clean.replace("```dot", "").replace("```", "")
+            
+            # 3. Filter lines that might be leftover python wrappers
+            lines = raw_clean.splitlines()
+            valid_lines = []
+            for line in lines:
+                s = line.strip()
+                # Skip variable assignments or empty prints
+                if s.startswith("dot_code") or s.startswith("print("): continue
+                valid_lines.append(line)
+            raw_clean = "\n".join(valid_lines)
 
-    # 5. GREEDY SELECTION
-    scored_sentences.sort(key=lambda x: x[0], reverse=True)
-    selected_sentences = []
-    current_word_count = 0
+            # 4. Extract Graph Block
+            start = raw_clean.find("digraph")
+            end = raw_clean.rfind("}")
+            
+            if start != -1 and end != -1 and end > start:
+                candidate = raw_clean[start:end+1]
+                
+                # FIX: Ensure it opens correctly
+                if "{" not in candidate:
+                    candidate = candidate.replace("digraph G", "digraph G {")
+                
+                # FIX: Inject Header Styles if missing
+                if "nodesep" not in candidate and "{" in candidate:
+                    parts = candidate.split("{", 1)
+                    if len(parts) == 2:
+                        candidate = DOT_HEADER + parts[1]
+                
+                # FIX: Replace invalid double-dashes
+                if "->" not in candidate and "--" in candidate:
+                     candidate = candidate.replace("--", "->")
 
-    for score, word_count, sent in scored_sentences:
-        if current_word_count + word_count <= target_words:
-            selected_sentences.append(sent)
-            current_word_count += word_count
-        if current_word_count >= target_words * 0.9:
-            break
+                dot_code = candidate
+                break
+            else:
+                print(f"   ⚠️ Attempt {attempt+1}: Invalid DOT syntax.")
+                
+        except Exception as e:
+            print(f"   ⚠️ Retry {attempt+1}: {e}")
 
-    # 6. PRESERVE ORDER
-    order_map = {sent: i for i, sent in enumerate(sentences)}
-    selected_sentences.sort(key=lambda x: order_map[x])
-    summary_text = " ".join(selected_sentences)
+    # 4. Render Image
+    image_url = None
+    if dot_code:
+        # Debugging Print
+        print(f"   🐛 DEBUG DOT CODE:\n{dot_code[:100]}...") 
 
-    return summary_text
+        dot_path = f"tmp/{file_id}.dot"
+        png_path = f"tmp/{file_id}.png"
+        with open(dot_path, "w") as f:
+            f.write(dot_code)
+        
+        try:
+            subprocess.run(["dot", "-Tpng", dot_path, "-o", png_path], check=True, stderr=subprocess.PIPE)
+            image_url = f"http://127.0.0.1:8000/{png_path}"
+            print("   ✅ Diagram generated successfully!")
+        except subprocess.CalledProcessError as e:
+            print(f"   ❌ Graphviz Syntax Error: {e.stderr.decode()}")
+        except Exception as e:
+            print(f"   ❌ Graphviz failed: {e}")
+    else:
+        print("   ❌ Failed to generate diagram after 3 attempts.")
+
+    return {
+        "transcript": transcript,
+        "notes": final_notes,
+        "image_url": image_url
+    }
 
 # --------------------
-# Route 1: PDF Summarization (New)
+# Routes
 # --------------------
+
+class RagQuery(BaseModel):
+    question: str
+
+class RagIngest(BaseModel):
+    text: str
+
+class QuizRequest(BaseModel):
+    note_content: str
+    num_questions: int = 3
+
+@app.post("/rag/ingest")
+async def rag_ingest(item: RagIngest):
+    """Manually ingest text into the RAG system"""
+    success = rag_solver.process_lecture_data(item.text)
+    if success:
+        return {"status": "success", "message": "Text indexed successfully."}
+    else:
+        raise HTTPException(status_code=400, detail="Empty text provided.")
+
+@app.post("/rag/query")
+async def rag_query(item: RagQuery):
+    """Ask a question about the currently indexed lecture"""
+    answer = rag_solver.ask_doubt(item.question)
+    return {"answer": answer}
+
+@app.post("/generate_quiz")
+async def generate_quiz(item: QuizRequest):
+    """Generates a high-accuracy conceptual quiz."""
+    if not item.note_content.strip():
+        raise HTTPException(status_code=400, detail="Note content is empty.")
+
+    print(f"🧠 Generating {item.num_questions} quiz questions...")
+    context_chunk = item.note_content[:5000]
+
+    # CHANGED: We now ask for 'correct_answer' and 'distractors' separately.
+    # Python will combine them to create the final options list.
+    system_prompt = """You are an expert academic evaluator. Create high-quality, challenging multiple-choice questions based ONLY on the provided text.
+    Rules:
+    1. Output strictly valid JSON.
+    2. Format: [
+        {
+            "question": "Question text here", 
+            "correct_answer": "The correct option text", 
+            "distractors": ["Wrong Option 1", "Wrong Option 2", "Wrong Option 3"], 
+            "explanation": "Brief explanation"
+        }
+    ]
+    3. Ensure the 'correct_answer' is factually correct based on the text.
+    4. Provide exactly 3 distractors.
+    """
+
+    user_prompt = f"""Create {item.num_questions} questions based on this text:
+    "{context_chunk}"
+    Return the JSON list ONLY."""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    try:
+        response_text = generate_llm(messages, max_new_tokens=1024, temperature=0.3)
+        
+        clean_json = re.sub(r'```json\s*|\s*```', '', response_text).strip()
+        match = re.search(r'\[.*\]', clean_json, re.DOTALL)
+        if match: clean_json = match.group(0)
+        
+        quiz_data = json.loads(clean_json)
+
+        # CHANGED: Construct options programmatically to guarantee correctness
+        final_quiz = []
+        for q in quiz_data:
+            # Basic Validation
+            if "correct_answer" not in q or "distractors" not in q:
+                continue
+            
+            correct_txt = q["correct_answer"].strip()
+            # Ensure distractors is a list
+            distractors = q["distractors"]
+            if not isinstance(distractors, list): continue
+
+            distractors = [str(d).strip() for d in distractors]
+            
+            # Combine
+            all_options = [correct_txt] + distractors
+            
+            # Shuffle options so the answer isn't always first
+            random.shuffle(all_options)
+            
+            # Find the new index of the correct answer
+            try:
+                correct_index = all_options.index(correct_txt)
+            except ValueError:
+                correct_index = 0 # Should never happen since we just added it
+            
+            final_q = {
+                "question": q.get("question", "Unknown Question"),
+                "options": all_options,
+                "answer": correct_index,
+                "explanation": q.get("explanation", "")
+            }
+            final_quiz.append(final_q)
+
+        return {"quiz": final_quiz}
+
+    except Exception as e:
+        print(f"❌ Quiz Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate quiz.")
+
+@app.post("/upload_cookies")
+async def upload_cookies(file: UploadFile):
+    try:
+        with open("cookies.txt", "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        print(f"✅ Cookies uploaded: {file.filename}")
+        return {"status": "success"}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/youtube_summarize")
+async def youtube_summarize(item: dict):
+    url = item.get("url")
+    if not url: return {"error": "No URL provided"}
+
+    output_folder = "tmp"
+    os.makedirs(output_folder, exist_ok=True)
+    file_id = f"yt_{int(time.time())}"
+    cookie_file = "cookies.txt" if os.path.exists("cookies.txt") else None
+    
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': f'{output_folder}/{file_id}.%(ext)s',
+        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+        'quiet': True,
+        'cookiefile': cookie_file
+    }
+
+    try:
+        print(f"Downloading: {url}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
+        audio_path = f"{output_folder}/{file_id}.mp3"
+        result = process_full_pipeline(audio_path, file_id)
+        
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+            
+        return result
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return {"error": str(e)}
+
 @app.post("/pdf_summarize")
 async def pdf_summarize(file: UploadFile):
     os.makedirs("./tmp", exist_ok=True)
     file_path = f"./tmp/{file.filename}"
-    
-    # Save uploaded file
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
-
     try:
-        print(f"Processing PDF: {file.filename}")
         doc = fitz.open(file_path)
-        total_pages = len(doc)
-        all_text = ""
-        words = []
-
-        # Extract Text
-        for page_num in range(total_pages):
-            page = doc[page_num]
-            text1 = page.get_text()
-            text2 = page.get_text("blocks")
-            text3 = " ".join([block[4] for block in text2 if isinstance(block[4], str)])
-            
-            combined = f"{text1}\n\n{text3}"
-            all_text += combined + f"\n--- Page {page_num+1} ---\n\n"
-            words.extend(re.findall(r'\b\w+\b', combined))
-
-        doc.close()
-
-        # Run Summarizer
-        summary_text = accurate_35_summarize(all_text)
+        text = ""
+        for page in doc: text += page.get_text() + "\n"
         
-        # Format as Markdown Report
-        sentences = re.split(r'[.!?]+', summary_text)
-        lines = [s.strip() for s in sentences if len(s.strip()) > 15]
-        summary_content = '\n\n'.join(lines[:60]) # Double newline for markdown readability
+        rag_solver.process_lecture_data(text)
+        
+        chunks = [text[i:i+3000] for i in range(0, len(text), 3000)]
+        summary_text = []
+        for ch in chunks:
+             if len(ch.split()) > 50:
+                s = summarizer(ch, max_length=150, min_length=30, do_sample=False)
+                summary_text.append(s[0]['summary_text'])
+        
+        final_summary = "\n".join(summary_text)
 
-        md_report = f"""# PDF Summary Report
-
-**File**: {file.filename}
-**Original Length**: {len(words):,} words
-**Summary Length**: {len(lines)} key sentences
-**Coverage**: 35% (TextRank Algorithm)
-
-## Summary Content
-
-{summary_content}
-
----
-**Generated**: {time.strftime('%Y-%m-%d %H:%M IST')}
-"""
+        original_word_count = len(text.split())
+        summary_word_count = len(final_summary.split())
         
         return {
-            "status": "success",
-            "summary_markdown": md_report,
-            "original_word_count": len(words),
-            "summary_word_count": len(re.findall(r'\b\w+\b', summary_text))
-        }
-
-    except Exception as e:
-        print(f"PDF Error: {e}")
-        return {"error": str(e)}
-    
+            "summary_markdown": final_summary,
+            "original_word_count": original_word_count,
+            "summary_word_count": summary_word_count
+        } 
     finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        if os.path.exists(file_path): os.remove(file_path)
 
-# --------------------
-# Route 2: File Upload (Audio/Video)
-# --------------------
 @app.post("/transcribe_and_summarize")
 async def transcribe_and_summarize(file: UploadFile):
     os.makedirs("./tmp", exist_ok=True)
-    audio_path = f"./tmp/{file.filename}"
-    with open(audio_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
+    path = f"./tmp/{file.filename}"
+    with open(path, "wb") as f: shutil.copyfileobj(file.file, f)
     try:
-        return process_audio(audio_path)
-    finally:
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-
-# --------------------
-# Route 3: YouTube Summarizer
-# --------------------
-@app.post("/youtube_summarize")
-async def youtube_summarize(item: dict):
-    url = item.get("url")
-    if not url:
-        return {"error": "No URL provided"}
-
-    os.makedirs("./tmp", exist_ok=True)
-    temp_filename = f"yt_{os.urandom(4).hex()}" 
-    
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': f'./tmp/{temp_filename}.%(ext)s',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'quiet': True,
-        'no_warnings': True
-    }
-
-    try:
-        print(f"Fetching YouTube Audio: {url}")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        segments, _ = whisper_model.transcribe(path, beam_size=5)
+        transcript = " ".join([s.text for s in segments])
         
-        audio_path = f"./tmp/{temp_filename}.mp3"
-        return process_audio(audio_path)
-
-    except Exception as e:
-        print(f"YouTube Error: {e}")
-        return {"error": str(e)}
-    
+        rag_solver.process_lecture_data(transcript)
+        
+        chunks = [transcript[i:i+3000] for i in range(0, len(transcript), 3000)]
+        summary = []
+        for ch in chunks:
+            if len(ch.split()) > 50:
+                s = summarizer(ch, max_length=150, min_length=30, do_sample=False)
+                summary.append(s[0]['summary_text'])
+        return {"transcript": transcript, "summary": summary}
     finally:
-        if os.path.exists(f"./tmp/{temp_filename}.mp3"):
-            os.remove(f"./tmp/{temp_filename}.mp3")
+        if os.path.exists(path): os.remove(path)
 
-# --------------------
-# Helper: Shared Processing Logic (Audio)
-# --------------------
-def process_audio(audio_path):
-    # 1. Transcribe (High Quality)
-    print("Transcribing...")
-    segments, _ = whisper_model_file.transcribe(audio_path, beam_size=5)
-    full_transcript = "".join([s.text for s in segments])
-
-    # 2. Summarize
-    print("Summarizing...")
-    chunk_size = 3000
-    chunks = [full_transcript[i:i+chunk_size] for i in range(0, len(full_transcript), chunk_size)]
-    bullet_points = []
-
-    for chunk in chunks:
-        input_len = len(chunk.split())
-        max_len = min(150, input_len // 2)
-        min_len = min(30, max_len // 2)
-
-        try:
-            if input_len > 10: 
-                summary = summarizer(chunk, max_length=max_len, min_length=min_len, do_sample=False)
-                bullet_points.append(f"- {summary[0]['summary_text']}")
-        except Exception as e:
-            print(f"Summarizer error: {e}")
-
-    return {
-        "transcript": full_transcript,
-        "summary": bullet_points
-    }
-
-# --------------------
-# Route 4: Live Transcription
-# --------------------
 @app.websocket("/ws/live_transcribe")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("Client connected for live transcription")
-    
     last_audio_bytes = b""
-    
     try:
         while True:
-            new_audio_bytes = await websocket.receive_bytes()
-            combined_audio = last_audio_bytes + new_audio_bytes
-            last_audio_bytes = new_audio_bytes 
-
-            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_audio:
-                temp_audio.write(combined_audio)
-                temp_audio_path = temp_audio.name
+            new_bytes = await websocket.receive_bytes()
+            combined = last_audio_bytes + new_bytes
+            last_audio_bytes = new_bytes
+            
+            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+                tmp.write(combined)
+                tmp_path = tmp.name
             
             try:
-                segments, _ = whisper_model_live.transcribe(
-                    temp_audio_path, 
-                    beam_size=1, 
-                    language="en",
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=500),
-                    condition_on_previous_text=False,
-                    initial_prompt="Live meeting transcript." 
-                )
-                
+                segments, _ = whisper_live.transcribe(tmp_path, beam_size=1)
                 text = " ".join([s.text for s in segments]).strip()
-                
-                if text:
-                    cleaned = text.lower().strip(".!? ")
-                    blacklist = ["you", "thank you", "thanks for watching"]
-                    if cleaned not in blacklist:
-                        print(f"Heard: {text}")
-                        await websocket.send_text(text)
-                    
+                if text: await websocket.send_text(text)
             finally:
-                if os.path.exists(temp_audio_path):
-                    os.remove(temp_audio_path)
-                    
-    except WebSocketDisconnect:
-        print("Client disconnected")
-    except Exception as e:
-        print(f"Error: {e}")
+                if os.path.exists(tmp_path): os.remove(tmp_path)
+    except Exception:
         await websocket.close()
