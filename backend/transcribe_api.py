@@ -167,54 +167,13 @@ DOT_HEADER = """digraph G {
 """
 
 # --------------------
-# Helper: Processing Pipeline
+# Helper: Diagram Generation Logic (Graphviz)
 # --------------------
-def process_full_pipeline(audio_path, file_id, model_size="medium"):
-    # 1. Transcribe
-    print(f"🎤 Stage 1: Transcribing using {model_size} model...")
-    model = get_whisper_model(model_size)
-    
-    segments, info = model.transcribe(audio_path, beam_size=5, language="en")
-    transcript = " ".join([s.text for s in segments]).strip()
-
-    # --- AUTO-INDEX FOR RAG ---
-    print("🧠 Indexing for RAG...")
-    rag_solver.process_lecture_data(transcript)
-    # --------------------------
-
-    # 2. Generate Lecture Notes
-    print("📝 Stage 2: Generating Notes...")
-    
-    chunks = [transcript[i:i+6000] for i in range(0, len(transcript), 6000)]
-    total_chunks = len(chunks)
-    print(f"   ↳ Found {total_chunks} chunks to process.")
-
-    chunk_summaries = []
-    
-    for i, chunk in enumerate(chunks):
-        print(f"   ⏳ Processing chunk {i+1}/{total_chunks}...") 
-        try:
-            summary = generate_llm([
-                {"role": "system", "content": "Summarize this section into detailed academic markdown notes."},
-                {"role": "user", "content": chunk}
-            ], max_new_tokens=512)
-            chunk_summaries.append(summary)
-        except Exception as e:
-            print(f"   ❌ Error processing chunk {i+1}: {e}")
-
-    merged_notes = "\n\n".join(chunk_summaries)
-    
-    print("   ↳ Finalizing notes...")
-    final_notes = generate_llm([
-        {"role": "system", "content": "Merge these summaries into one clean, structured set of Lecture Notes (Markdown). Use Headers, Bullet points, and Bold text."},
-        {"role": "user", "content": merged_notes[:10000]} 
-    ], max_new_tokens=1024)
-
-    # 3. Generate Visual Diagram
-    print("🎨 Stage 3: Visualizing...")
+def generate_diagram(text_content, file_id):
+    print("🎨 Generating Diagram...")
     concepts = generate_llm([
         {"role": "system", "content": "Extract 8 key concepts and their relationships from these notes."},
-        {"role": "user", "content": final_notes[:4000]}
+        {"role": "user", "content": text_content[:4000]}
     ], max_new_tokens=256)
 
     system_prompt = """
@@ -267,9 +226,10 @@ def process_full_pipeline(audio_path, file_id, model_size="medium"):
         except Exception as e:
             print(f"   ⚠️ Retry {attempt+1}: {e}")
 
-    # 4. Render Image
+    # Render Image
     image_url = None
     if dot_code:
+        os.makedirs("tmp", exist_ok=True)
         dot_path = f"tmp/{file_id}.dot"
         png_path = f"tmp/{file_id}.png"
         with open(dot_path, "w") as f:
@@ -282,11 +242,57 @@ def process_full_pipeline(audio_path, file_id, model_size="medium"):
             print(f"   ❌ Graphviz Syntax Error: {e.stderr.decode()}")
         except Exception as e:
             print(f"   ❌ Graphviz failed: {e}")
+            
+    return image_url
 
+# --------------------
+# Helper: Processing Pipeline
+# --------------------
+def process_full_pipeline(audio_path, file_id, model_size="medium"):
+    # 1. Transcribe
+    print(f"🎤 Stage 1: Transcribing using {model_size} model...")
+    model = get_whisper_model(model_size)
+    
+    segments, info = model.transcribe(audio_path, beam_size=5, language="en")
+    transcript = " ".join([s.text for s in segments]).strip()
+
+    # --- AUTO-INDEX FOR RAG ---
+    print("🧠 Indexing for RAG...")
+    rag_solver.process_lecture_data(transcript)
+    # --------------------------
+
+    # 2. Generate Lecture Notes
+    print("📝 Stage 2: Generating Notes...")
+    
+    chunks = [transcript[i:i+6000] for i in range(0, len(transcript), 6000)]
+    total_chunks = len(chunks)
+    print(f"   ↳ Found {total_chunks} chunks to process.")
+
+    chunk_summaries = []
+    
+    for i, chunk in enumerate(chunks):
+        print(f"   ⏳ Processing chunk {i+1}/{total_chunks}...") 
+        try:
+            summary = generate_llm([
+                {"role": "system", "content": "Summarize this section into detailed academic markdown notes."},
+                {"role": "user", "content": chunk}
+            ], max_new_tokens=512)
+            chunk_summaries.append(summary)
+        except Exception as e:
+            print(f"   ❌ Error processing chunk {i+1}: {e}")
+
+    merged_notes = "\n\n".join(chunk_summaries)
+    
+    print("   ↳ Finalizing notes...")
+    final_notes = generate_llm([
+        {"role": "system", "content": "Merge these summaries into one clean, structured set of Lecture Notes (Markdown). Use Headers, Bullet points, and Bold text."},
+        {"role": "user", "content": merged_notes[:10000]} 
+    ], max_new_tokens=1024)
+    
     return {
         "transcript": transcript,
         "notes": final_notes,
-        "image_url": image_url
+        "image_url": None 
     }
 
 # --------------------
@@ -302,6 +308,9 @@ class RagIngest(BaseModel):
 class QuizRequest(BaseModel):
     note_content: str
     num_questions: int = 3
+    
+class MindMapRequest(BaseModel):
+    note_content: str
 
 @app.post("/rag/ingest")
 async def rag_ingest(item: RagIngest):
@@ -385,6 +394,19 @@ async def generate_quiz(item: QuizRequest):
     except Exception as e:
         print(f"❌ Quiz Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate quiz.")
+
+@app.post("/generate_mindmap")
+async def generate_mindmap(item: MindMapRequest):
+    if not item.note_content.strip():
+         raise HTTPException(status_code=400, detail="Note content is empty.")
+    
+    file_id = f"map_{int(time.time())}"
+    image_url = generate_diagram(item.note_content, file_id)
+    
+    if not image_url:
+        raise HTTPException(status_code=500, detail="Failed to generate mind map.")
+        
+    return {"image_url": image_url}
 
 @app.post("/upload_cookies")
 async def upload_cookies(file: UploadFile):
