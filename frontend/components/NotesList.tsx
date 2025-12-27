@@ -28,8 +28,8 @@ type Doc = {
 };
 
 export default function NotesList() {
-    const router = useRouter();
-    const {user, logout} = useAuth();
+  const router = useRouter();
+  const { user, logout } = useAuth();
 
 
   const [docs, setDocs] = useState<Doc[]>([]);
@@ -37,7 +37,7 @@ export default function NotesList() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const { setSelectedNoteId, setName, setContent } = useNote()
 
-  
+
   const loadDocs = () => {
     apiFetch("/fileTree/documents")
       .then(r => r.json())
@@ -53,9 +53,9 @@ export default function NotesList() {
     docs.forEach(doc => {
       const parent =
         !doc.parentId ||
-        doc.parentId === "null" ||
-        doc.parentId === "" ||
-        doc.parentId === "root"
+          doc.parentId === "null" ||
+          doc.parentId === "" ||
+          doc.parentId === "root"
           ? "root"
           : doc.parentId;
 
@@ -108,7 +108,7 @@ export default function NotesList() {
     const parentId = getParentForNewItem();
 
     const docs = await apiFetch("/fileTree/addNote", {
-       method: "POST",
+      method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         name,
@@ -140,17 +140,17 @@ export default function NotesList() {
           doc.type === "folder" ? (
             <li key={doc._id}>
               <div
-                onClick={() => {
+                onClick={(e) => {
+                  e.stopPropagation();
                   toggleExpand(doc._id);
                   setSelectedId(doc._id);
                 }}
                 className={`
                   flex items-center gap-2 px-2 py-1 rounded-md cursor-pointer
                   transition
-                  ${
-                    selectedId === doc._id
-                      ? "bg-neutral-800 text-white"
-                      : "text-neutral-300 hover:bg-neutral-800/60"
+                  ${selectedId === doc._id
+                    ? "bg-neutral-800 text-white"
+                    : "text-neutral-300 hover:bg-neutral-800/60"
                   }
                 `}
               >
@@ -170,25 +170,25 @@ export default function NotesList() {
                 className={`
                   flex items-center gap-2 px-2 py-1 rounded-md cursor-pointer
                   transition
-                  ${
-                    selectedId === doc._id
-                      ? "bg-neutral-800 text-white"
-                      : "text-neutral-300 hover:bg-neutral-800/60 hover:translate-x-[2px]"
+                  ${selectedId === doc._id
+                    ? "bg-neutral-800 text-white"
+                    : "text-neutral-300 hover:bg-neutral-800/60 hover:translate-x-[2px]"
                   }
                 `}
-                onClick={() =>{
-                  setSelectedNoteId(doc._id)
-                  setName(doc.name)
-                  setSelectedId(doc._id)
-                
-                apiFetch("/fileTree/getNoteById", {
-                method: "POST",
-                body: JSON.stringify({ noteID: doc._id }),
-              })
-                .then((e) => e.json())
-                .then((data) => setContent(data[0]?.content ?? ""));
+                onClick={(e) => {
+
+                  e.stopPropagation();
+                  setSelectedNoteId(doc._id);
+                  setName(doc.name);
+                  setSelectedId(doc._id);
+
+                  apiFetch("/fileTree/getNoteById", {
+                    method: "POST",
+                    body: JSON.stringify({ noteID: doc._id }),
+                  })
+                    .then(r => r.json())
+                    .then(data => setContent(data[0]?.content ?? ""));
                 }}
-                  
               >
                 <FileIcon size={18} className="opacity-80" />
                 <span>{doc.name}</span>
@@ -231,26 +231,26 @@ export default function NotesList() {
         </div>
 
         {/* TREE */}
-        <div className="-ml-3 mt-4 w-full h-full">
+        <div className="-ml-3 mt-4 w-full h-full" onClick={() => setSelectedId(null)}>
           {renderChildren("root")}
         </div>
 
-          <div className="account-controls flex pb-5 items-center justify-between">
-        
-        <div className="flex gap-2 items-center"><div className="w-8">
-          <img className="rounded-full" src={`https://ui-avatars.com/api/?name=${user?.name}&size=256`} />
-        </div>
-        <span className="text-lg text-stone-300">{user?.name}</span>
-        </div>
-        <Button className="bg-transparent text-white rounded-full hover:bg-stone-900" onClick={() => {
-          setSelectedNoteId(null)
-          setContent("")
-          logout()
-          }}>
-          <LogOutIcon/>
-        </Button>
+        <div className="account-controls flex pb-5 items-center justify-between">
 
-      </div>
+          <div className="flex gap-2 items-center"><div className="w-8">
+            <img className="rounded-full" src={`https://ui-avatars.com/api/?name=${user?.name}&size=256`} />
+          </div>
+            <span className="text-lg text-stone-300">{user?.name}</span>
+          </div>
+          <Button className="bg-transparent text-white rounded-full hover:bg-stone-900" onClick={() => {
+            setSelectedNoteId(null)
+            setContent("")
+            logout()
+          }}>
+            <LogOutIcon />
+          </Button>
+
+        </div>
       </div>
     </div>
   );
